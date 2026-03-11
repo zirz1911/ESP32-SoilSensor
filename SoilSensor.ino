@@ -11,6 +11,7 @@
 #include <Arduino.h>
 #include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 
@@ -26,8 +27,8 @@
 #define LED_GREEN  14
 
 // ─── WiFi ─────────────────────────────────────────────────
-const char* WIFI_SSID     = "Wifi_Office 5GHz";
-const char* WIFI_PASSWORD = "5tgb@1234567890";
+const char* WIFI_SSID     = "wifiopenclaw";
+const char* WIFI_PASSWORD = "1234567890";
 
 // ─── Modbus request frame ─────────────────────────────────
 byte request[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08};
