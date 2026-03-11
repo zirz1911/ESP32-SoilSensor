@@ -1,169 +1,173 @@
 /*
- * ESP32 Soil Sensor 7-in-1 with WiFi + WebSocket
- * RS485 Modbus RTU + LCD 20x4 + LED Indicators
+ * ESP32 Soil Sensor 7-in-1
+ * RS485 Raw Modbus + LCD 20x4 I2C + LED + WiFi + WebSocket
  *
- * Libraries required:
- *   - ModbusMaster       (Doc Walker)
+ * Libraries:
  *   - LiquidCrystal_I2C  (Frank de Brabander)
- *   - WebSockets         (Markus Sattler - arduinoWebSockets)
+ *   - WebSockets         (Markus Sattler)
+ *   - ArduinoJson
  */
 
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
-#include <ModbusMaster.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 
-// ─── WiFi ──────────────────────────────────────────────────
-const char* WIFI_SSID     = "Wifi_Office 5GHz";
-const char* WIFI_PASSWORD = "5tgb@1234567890";
-
-// ─── RS485 Modbus ─────────────────────────────────────────
-#define RXD_PIN   16
-#define TXD_PIN   17
-#define DE_PIN    18
-#define RE_PIN    19
-#define MODBUS_BAUD 9600
-#define SLAVE_ID    1
+// ─── RS485 ────────────────────────────────────────────────
+#define RXD2  16
+#define TXD2  17
+#define DE    18
+#define RE    19
 
 // ─── LED ──────────────────────────────────────────────────
 #define LED_RED    13
 #define LED_YELLOW 12
 #define LED_GREEN  14
 
-// ─── LCD ──────────────────────────────────────────────────
-LiquidCrystal_I2C lcd(0x27, 20, 4);
+// ─── WiFi ─────────────────────────────────────────────────
+const char* WIFI_SSID     = "Wifi_Office 5GHz";
+const char* WIFI_PASSWORD = "5tgb@1234567890";
 
-// ─── Modbus ───────────────────────────────────────────────
-ModbusMaster node;
+// ─── Modbus request frame ─────────────────────────────────
+byte request[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08};
 
-// ─── WebSocket Server port 81 ─────────────────────────────
-WebSocketsServer webSocket(81);
+// ─── LCD + WebSocket ──────────────────────────────────────
+LiquidCrystal_I2C  lcd(0x27, 20, 4);
+WebSocketsServer   webSocket(81);
 
-// ─── Sensor Data ──────────────────────────────────────────
+// ─── Soil data ────────────────────────────────────────────
 struct SoilData {
   float moisture;
   float temperature;
   float ec;
   float ph;
-  int   nitrogen;
-  int   phosphorus;
-  int   potassium;
-} soil;
+  float nitrogen;
+  float phosphorus;
+  float potassium;
+};
 
-// ─── Timing ───────────────────────────────────────────────
-unsigned long lastSensorRead  = 0;
-unsigned long lastWsbroadcast = 0;
-unsigned long lastLcdSwitch   = 0;
-const unsigned long SENSOR_INTERVAL   = 1000;  // read every 1s
-const unsigned long WS_INTERVAL       = 2000;  // broadcast every 2s
-const unsigned long LCD_SWITCH_INTERVAL = 4000; // switch LCD page every 4s
+SoilData soil = {0};
+bool     dataReady = false;
+
+// ─── Timing (non-blocking) ────────────────────────────────
+unsigned long lastRequest  = 0;
+unsigned long lastBroadcast = 0;
+unsigned long lastLcdSwitch = 0;
+unsigned long lastReconnect = 0;
+
+const unsigned long REQUEST_INTERVAL  = 3000;   // อ่าน sensor ทุก 3s
+const unsigned long BROADCAST_INTERVAL = 2000;  // broadcast WS ทุก 2s
+const unsigned long LCD_SWITCH_INTERVAL = 4000; // สลับหน้า LCD ทุก 4s
+
 int lcdPage = 0;
 
-// ─── RS485 direction control ──────────────────────────────
-void preTransmission()  { digitalWrite(DE_PIN, HIGH); digitalWrite(RE_PIN, HIGH); }
-void postTransmission() { digitalWrite(DE_PIN, LOW);  digitalWrite(RE_PIN, LOW);  }
-
-// ─── Read Modbus sensor ───────────────────────────────────
-bool readSensor() {
-  uint8_t result = node.readHoldingRegisters(0x0000, 7);
-  if (result == node.ku8MBSuccess) {
-    soil.moisture    = node.getResponseBuffer(0) / 10.0;
-    soil.temperature = node.getResponseBuffer(1) / 10.0;
-    soil.ec          = node.getResponseBuffer(2);
-    soil.ph          = node.getResponseBuffer(3) / 10.0;
-    soil.nitrogen    = node.getResponseBuffer(4);
-    soil.phosphorus  = node.getResponseBuffer(5);
-    soil.potassium   = node.getResponseBuffer(6);
-    return true;
-  }
-  return false;
+// ─── RS485: send request ─────────────────────────────────
+void sendRequest() {
+  digitalWrite(DE, HIGH);
+  digitalWrite(RE, HIGH);
+  delay(10);
+  Serial2.write(request, sizeof(request));
+  Serial2.flush();
+  digitalWrite(DE, LOW);
+  digitalWrite(RE, LOW);
 }
 
-// ─── LED indicator by moisture ───────────────────────────
-void updateLED() {
+// ─── Parse raw response bytes ────────────────────────────
+SoilData parseResponse(byte* data) {
+  SoilData s;
+  s.moisture    = ((data[3]  << 8) | data[4])  / 10.0;
+  s.temperature = ((data[5]  << 8) | data[6])  / 10.0;
+  s.ec          = ((data[7]  << 8) | data[8])  / 1.0;
+  s.ph          = ((data[9]  << 8) | data[10]) / 10.0;
+  s.nitrogen    = ((data[11] << 8) | data[12]) / 1.0;
+  s.phosphorus  = ((data[13] << 8) | data[14]) / 1.0;
+  s.potassium   = ((data[15] << 8) | data[16]) / 1.0;
+  return s;
+}
+
+// ─── LCD pages ────────────────────────────────────────────
+void displayPage1(SoilData s) {
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.printf("Moist : %.1f %%",    s.moisture);
+  lcd.setCursor(0, 1); lcd.printf("Temp  : %.1f C",     s.temperature);
+  lcd.setCursor(0, 2); lcd.printf("EC    : %.0f us/cm", s.ec);
+  lcd.setCursor(0, 3); lcd.printf("pH    : %.1f",       s.ph);
+}
+
+void displayPage2(SoilData s) {
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("-- NPK (mg/kg) --");
+  lcd.setCursor(0, 1); lcd.printf("N : %.0f", s.nitrogen);
+  lcd.setCursor(0, 2); lcd.printf("P : %.0f", s.phosphorus);
+  lcd.setCursor(0, 3); lcd.printf("K : %.0f", s.potassium);
+}
+
+void displayPage3() {
+  // Page 3: IP address (แสดงหลัง page 2)
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("-- WiFi Info --");
+  lcd.setCursor(0, 1); lcd.print("IP:");
+  lcd.setCursor(0, 2); lcd.print(WiFi.localIP().toString());
+  lcd.setCursor(0, 3); lcd.print("WS Port: 81");
+}
+
+// ─── LED by moisture ─────────────────────────────────────
+void updateLED(float moisture) {
   digitalWrite(LED_RED,    LOW);
   digitalWrite(LED_YELLOW, LOW);
   digitalWrite(LED_GREEN,  LOW);
-
-  if (soil.moisture < 30.0) {
-    digitalWrite(LED_RED, HIGH);
-  } else if (soil.moisture <= 80.0) {
-    digitalWrite(LED_YELLOW, HIGH);
-  } else {
-    digitalWrite(LED_GREEN, HIGH);
-  }
+  if      (moisture < 30.0)  digitalWrite(LED_RED,    HIGH);
+  else if (moisture <= 80.0) digitalWrite(LED_YELLOW, HIGH);
+  else                       digitalWrite(LED_GREEN,  HIGH);
 }
 
-// ─── LCD display (2 pages) ────────────────────────────────
-void updateLCD() {
-  lcd.clear();
-  if (lcdPage == 0) {
-    // Page 1: Moisture, Temp, EC, pH
-    lcd.setCursor(0, 0); lcd.print("Moisture: ");   lcd.print(soil.moisture, 1);   lcd.print("%");
-    lcd.setCursor(0, 1); lcd.print("Temp:     ");   lcd.print(soil.temperature, 1); lcd.print(" C");
-    lcd.setCursor(0, 2); lcd.print("EC:       ");   lcd.print(soil.ec, 0);          lcd.print(" us/cm");
-    lcd.setCursor(0, 3); lcd.print("pH:       ");   lcd.print(soil.ph, 1);
-  } else {
-    // Page 2: N, P, K + IP
-    lcd.setCursor(0, 0); lcd.print("Nitrogen:  "); lcd.print(soil.nitrogen);  lcd.print(" mg/kg");
-    lcd.setCursor(0, 1); lcd.print("Phosphorus:"); lcd.print(soil.phosphorus); lcd.print(" mg/kg");
-    lcd.setCursor(0, 2); lcd.print("Potassium: "); lcd.print(soil.potassium); lcd.print(" mg/kg");
-    lcd.setCursor(0, 3); lcd.print(WiFi.localIP().toString());
-  }
-}
+// ─── WebSocket: broadcast JSON ───────────────────────────
+void broadcastJSON() {
+  if (!dataReady) return;
 
-// ─── Broadcast JSON via WebSocket ────────────────────────
-void broadcastSensorData() {
   StaticJsonDocument<256> doc;
-  doc["moisture"]    = soil.moisture;
-  doc["temperature"] = soil.temperature;
-  doc["ec"]          = soil.ec;
-  doc["ph"]          = soil.ph;
-  doc["nitrogen"]    = soil.nitrogen;
-  doc["phosphorus"]  = soil.phosphorus;
-  doc["potassium"]   = soil.potassium;
+  doc["moisture"]    = round(soil.moisture    * 10) / 10.0;
+  doc["temperature"] = round(soil.temperature * 10) / 10.0;
+  doc["ec"]          = (int)soil.ec;
+  doc["ph"]          = round(soil.ph          * 10) / 10.0;
+  doc["nitrogen"]    = (int)soil.nitrogen;
+  doc["phosphorus"]  = (int)soil.phosphorus;
+  doc["potassium"]   = (int)soil.potassium;
 
   String json;
   serializeJson(doc, json);
   webSocket.broadcastTXT(json);
 }
 
-// ─── WebSocket event handler ──────────────────────────────
-void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED:
-      Serial.printf("[WS] Client #%u connected\n", num);
-      broadcastSensorData(); // send immediately on connect
-      break;
-    case WStype_DISCONNECTED:
-      Serial.printf("[WS] Client #%u disconnected\n", num);
-      break;
-    default:
-      break;
+// ─── WebSocket event ─────────────────────────────────────
+void onWSEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    Serial.printf("[WS] Client #%u connected\n", num);
+    broadcastJSON(); // ส่งข้อมูลล่าสุดทันทีที่ client เชื่อมต่อ
+  } else if (type == WStype_DISCONNECTED) {
+    Serial.printf("[WS] Client #%u disconnected\n", num);
   }
 }
 
-// ─── WiFi connect ─────────────────────────────────────────
+// ─── WiFi connect ────────────────────────────────────────
 void connectWiFi() {
-  Serial.print("Connecting to WiFi");
+  Serial.print("Connecting WiFi");
   lcd.clear();
   lcd.setCursor(0, 0); lcd.print("Connecting WiFi...");
+  lcd.setCursor(0, 1); lcd.print(WIFI_SSID);
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
     delay(500);
     Serial.print(".");
-    attempts++;
+    tries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-
+    Serial.printf("\nWiFi OK — IP: %s\n", WiFi.localIP().toString().c_str());
     lcd.clear();
     lcd.setCursor(0, 0); lcd.print("WiFi Connected!");
     lcd.setCursor(0, 1); lcd.print("IP:");
@@ -171,15 +175,15 @@ void connectWiFi() {
     lcd.setCursor(0, 3); lcd.print("WS Port: 81");
     delay(3000);
   } else {
-    Serial.println("\nWiFi FAILED — running offline");
+    Serial.println("\nWiFi FAILED — offline mode");
     lcd.clear();
     lcd.setCursor(0, 0); lcd.print("WiFi FAILED");
-    lcd.setCursor(0, 1); lcd.print("Running offline");
+    lcd.setCursor(0, 1); lcd.print("Offline mode");
     delay(2000);
   }
 }
 
-// ─── Setup ────────────────────────────────────────────────
+// ─── Setup ───────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
@@ -187,79 +191,95 @@ void setup() {
   pinMode(LED_RED,    OUTPUT);
   pinMode(LED_YELLOW, OUTPUT);
   pinMode(LED_GREEN,  OUTPUT);
+  digitalWrite(LED_RED, HIGH); // RED on during boot
 
   // LCD
   Wire.begin();
-  lcd.init();
+  lcd.begin();
   lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("Soil Sensor 7-in-1");
-  lcd.setCursor(0, 1);
-  lcd.print("Initializing...");
+  lcd.setCursor(0, 1); lcd.print("  Soil Sensor 7in1  ");
+  lcd.setCursor(0, 2); lcd.print("   Initializing...  ");
+  delay(2000);
 
-  // RS485 Modbus
-  Serial2.begin(MODBUS_BAUD, SERIAL_8N1, RXD_PIN, TXD_PIN);
-  pinMode(DE_PIN, OUTPUT);
-  pinMode(RE_PIN, OUTPUT);
-  digitalWrite(DE_PIN, LOW);
-  digitalWrite(RE_PIN, LOW);
+  // RS485
+  Serial2.begin(4800, SERIAL_8N1, RXD2, TXD2);
+  pinMode(DE, OUTPUT);
+  pinMode(RE, OUTPUT);
+  digitalWrite(DE, LOW);
+  digitalWrite(RE, LOW);
 
-  node.begin(SLAVE_ID, Serial2);
-  node.preTransmission(preTransmission);
-  node.postTransmission(postTransmission);
-
-  // WiFi
+  // WiFi + WebSocket
   connectWiFi();
-
-  // WebSocket
   if (WiFi.status() == WL_CONNECTED) {
     webSocket.begin();
-    webSocket.onEvent(onWebSocketEvent);
+    webSocket.onEvent(onWSEvent);
     Serial.println("WebSocket server started on port 81");
   }
 
-  delay(500);
+  digitalWrite(LED_RED, LOW);
 }
 
 // ─── Loop ────────────────────────────────────────────────
 void loop() {
   unsigned long now = millis();
 
-  // WebSocket loop
+  // WebSocket
   if (WiFi.status() == WL_CONNECTED) {
     webSocket.loop();
   }
 
-  // Read sensor every 1s
-  if (now - lastSensorRead >= SENSOR_INTERVAL) {
-    lastSensorRead = now;
-    if (readSensor()) {
-      updateLED();
+  // WiFi auto-reconnect
+  if (WiFi.status() != WL_CONNECTED && now - lastReconnect > 10000) {
+    lastReconnect = now;
+    Serial.println("WiFi lost — reconnecting...");
+    WiFi.reconnect();
+  }
+
+  // อ่าน sensor
+  if (now - lastRequest >= REQUEST_INTERVAL) {
+    lastRequest = now;
+    sendRequest();
+    delay(200); // รอ response
+
+    if (Serial2.available() >= 19) {
+      byte buf[19];
+      Serial2.readBytes(buf, 19);
+      soil = parseResponse(buf);
+      dataReady = true;
+
+      // Serial Monitor
+      Serial.println("========== Soil Data ==========");
+      Serial.printf("Moisture    : %.1f %%\n",    soil.moisture);
+      Serial.printf("Temperature : %.1f C\n",     soil.temperature);
+      Serial.printf("EC          : %.0f us/cm\n", soil.ec);
+      Serial.printf("pH          : %.1f\n",       soil.ph);
+      Serial.printf("Nitrogen    : %.0f mg/kg\n", soil.nitrogen);
+      Serial.printf("Phosphorus  : %.0f mg/kg\n", soil.phosphorus);
+      Serial.printf("Potassium   : %.0f mg/kg\n", soil.potassium);
+      Serial.println("================================");
+
+      updateLED(soil.moisture);
     }
   }
 
-  // Broadcast WebSocket every 2s
-  if (now - lastWsbroadcast >= WS_INTERVAL) {
-    lastWsbroadcast = now;
+  // Broadcast WebSocket ทุก 2s
+  if (dataReady && now - lastBroadcast >= BROADCAST_INTERVAL) {
+    lastBroadcast = now;
     if (WiFi.status() == WL_CONNECTED) {
-      broadcastSensorData();
+      broadcastJSON();
     }
   }
 
-  // LCD page switch every 4s
+  // สลับหน้า LCD ทุก 4s (3 หน้า: sensor1, sensor2, wifi)
   if (now - lastLcdSwitch >= LCD_SWITCH_INTERVAL) {
     lastLcdSwitch = now;
-    lcdPage = (lcdPage + 1) % 2;
-    updateLCD();
-  }
-
-  // WiFi reconnect if lost
-  if (WiFi.status() != WL_CONNECTED) {
-    static unsigned long lastReconnect = 0;
-    if (now - lastReconnect > 10000) {
-      lastReconnect = now;
-      Serial.println("WiFi lost — reconnecting...");
-      WiFi.reconnect();
+    if (dataReady) {
+      switch (lcdPage) {
+        case 0: displayPage1(soil); break;
+        case 1: displayPage2(soil); break;
+        case 2: displayPage3();     break;
+      }
+      lcdPage = (lcdPage + 1) % 3;
     }
   }
 }
